@@ -3,6 +3,15 @@
 '''
 A program for analysing Mach-Zehnder interferometer measurements and extracting laser linewidths
 A. J. McCulloch, September 2019
+
+This program is deigned to make anaysis of complementary linewidth measurement techniques quick
+and easy. Folders containing the relevant data from either the RS spectrum analyser or mognoise
+ADC should be in seperate folders.
+
+Naming conventions for files from the RS are 'Date-description', with discription of central
+frequency (e.g. '20190918-32') or the full trace (e.g. '20190918-FULL')
+
+Naming conventions for files from the mognoise ADC are 'Laser#description' (e.g. 'Laser1binned')
 '''
 
 ####################################################################################################
@@ -225,7 +234,25 @@ def fitCurve(x, y, fitfunc, p_initial, y_err=None, errors=False):
         return p1
 
 ####################################################################################################
+# Returns the area under a curve specified at points (x,y) between x = lower and x = upper
+def retrunarea(x, y, lower, upper):
+    # Set upper and lower limits for integration
+    x_low = lower
+    x_high = upper
+    x_vals = x[(x > x_low ) & (x < x_high)] # Select x values between the limits
+    # Return the indexes for the array to integrate
+    findindex = lambda i: [int(np.where(i == x_vals[0])[0]), int(np.where(i == x_vals[-1])[0]) + 1]
+    totake = findindex(x)
+
+    area = integrate.simps(y[totake[0]:totake[1]], x_vals) # Integrate using Simpson's rule within the bounds
+
+    return area
+
+####################################################################################################
 # Define major functions
+####################################################################################################
+
+# Functions for Three-conered hat anaysis
 ####################################################################################################
 
 ####################################################################################################
@@ -497,11 +524,14 @@ def TCH_runner(folder, points = 1000, fitsz = 1):
         Print('Close any .pdf files you have open')
         os.chdir(cwd) # Set the working directory to the original directory
 
+# Functions for Mach-Zehnder beatnote anaysis
+####################################################################################################
+
 ####################################################################################################
 # Returns the V_rms value calculated from the area under the PSD curve between frequencies lowerbound and upperbound
 def getVrms(trace, lowerbound, upperbound, doplot = False):
     # Convert PSD in dBm/Hz to V_rms^2/Hz
-    dbmtov = lambda p: (50*1e-3)*(10 ** (p/10))
+    dbmtov = lambda p: (50 * 1e-3)*(10 ** (p/10))
     # Power spectral density (in V_rms^2/Hz)
     psd = dbmtov(trace.y)
 
@@ -531,8 +561,77 @@ def getVrms(trace, lowerbound, upperbound, doplot = False):
     return vrms
 
 ####################################################################################################
-# Returns the V_rms value calculated from the area under the PSD curve between frequencies lowerbound and upperbound
-def MZIrunner(folder):
+# Returns the calibration factor to convert from voltage to frequency
+def returncalib(trace, reffreq = 30, FSR = 20e6):
+    x0 = reffreq # Reference signal location [Hz]
+    xc = trace.x[np.abs(trace.x-x0).argmin()] # Find the closest x value to x0
+    xci = np.where(trace.x == xc)[0][0] # Return the index of closest location
+    xci0 = xci # Store this original value
+
+    # Need to check if there are greater values nearby (x \pm delta)
+    if trace.y[xci+1] > trace.y[xci]: # See if the index + 1 is a greater value
+        xci += 1
+        while True: # Keep going until you find the maximum
+            if trace.y[xci+1] > trace.y[xci]:
+                xci += 1
+            else:
+                break
+    elif trace.y[xci-1] > trace.y[xci]:  # See if the index - 1 is a greater value
+        xci -= 1
+        while True:
+            if trace.y[xci-1] > trace.y[xci]:  # Keep going until you find the maximum
+                xci -= 1
+            else:
+                break
+
+    if abs(xci - xci0) <= 5: # Make sure that we have not gone too far, the peak should be where we expect!
+        yc = trace.y[xci] # Calibration power
+    else:
+        print("Invalid spectrum. No clear peak found around " + str(x0) + " Hz")
+
+    dBmtoVRMS = lambda p: np.sqrt((50 * 1e-3)*(10 ** (p/10)))
+    cal = 2 * np.pi * (dBmtoVRMS(yc)/FSR)
+
+    return 1/cal
+
+####################################################################################################
+# Returns the RMS value of the linewidth calculated from the area under the PSD curve between the frequencies lowerbound and upperbound
+def getlinewidthRMS(trace, lowerbound, upperbound, doplot = False):
+    RBW = 2.5e6/2097152 # Resolution bandwidth from ADC
+    impedance = 50 # Electrical impedance for calculating voltage from power
+    calibration = returncalib(trace)
+    dbmtoW = lambda p: (1e-3)*(10 ** (p/10)) # Convert power from dBm to Watts
+
+    WperHz = dbmtoW(trace.y)/RBW # Power per Hertz
+    VperrtHz = np.sqrt(impedance * WperHz) # Voltage per Root Hertz
+    LSD = VperrtHz * calibration # Linear spectral density [Hz/Hz^1/2]
+    trace.PSD = LSD ** 2 # Power spectral density [Hz^2/Hz]
+
+    linewidthRMS = np.sqrt(retrunarea(trace.x, trace.PSD, lowerbound, upperbound))
+
+    if doplot == True:
+        # Set the plot parameters
+        plt.rcParams['figure.figsize'] = [12, 9] # Set figure size
+        plt.title("Demodulated Mach-Zehnder beatnote", fontsize=32) # Set the figure title
+        plt.xlabel("Frequency [Hz]", fontsize=24) # Set the x-axis label
+        plt.ylabel("Power spectral density [Hz$^2$/Hz]", fontsize=24) # Set the y-axis label
+        plt.xticks(size = 18) # Set the size of the x-axis markers
+        plt.yticks(size = 18) # Set the size of the y-axis markers
+
+        plt.grid(which = 'major') # Include major gridlines
+        plt.grid(which = 'minor', linewidth = .1, alpha = 1) # Include minor gridlines
+
+        plt.plot(trace.x, trace.PSD, linewidth = 2, alpha = .75)
+        plt.xscale('log')
+        plt.yscale('log')
+
+    return calibration, linewidthRMS
+
+####################################################################################################
+# The runner function for the analysis of the Mach-Zehnder interferometre beatnote
+# The folder input should be the directory of the files to analyse
+# The method input must be either 'PSD' or 'VRMS'
+def MZIrunner(folder, method):
     cwd = os.getcwd() # Current working directoy
     # If you look at a .pdf and run this again, you will get a permissions error; however the cwd should always be reset
     try:
@@ -550,34 +649,69 @@ def MZIrunner(folder):
 
         # Initialise the list of results
         file = []
-        vRMScalib = []
-        vRMSlinewidth = []
-        linewidths = []
-        FSR = 20e6 # Free spectral range of the fibre
+        cal_res = []
+        lw_res = []
 
-        # Loop over spectra
-        for spec in spectra:
-            trace = MOGTrace(spec) # Import the traces
-            ax.plot(trace.x, trace.y, linestyle = '-', linewidth = 1, alpha = .75, label = spec[:-10]) # Plot the traces
+        if method == 'PSD':
+            # Initialise the list of method specific results
+            ylabeltext = 'Power spectral density [Hz$^2$/Hz]'
+            yscale = 'log'
+            outtitle = '_Hz2'
 
-            if spec[:-10].lower() != 'background':
-                vc = getVrms(trace, 25, 35) # Get the value of V_rms for the 30 Hz peak
-                vl = getVrms(trace, 50, 1e5) # Get the value of V_rms up to 100 kHz
+            # Loop over spectra
+            for spec in spectra:
+                trace = MOGTrace(spec) # Import the traces
 
-                file.append(spec[:-10]) # Laser name
-                vRMScalib.append(vc) # Get the value of V_rms for the 30 Hz peak
-                vRMSlinewidth.append(vl) # Get the value of V_rms up to 100 kHz
-                lwidth = lambda r: r * FSR/(2 * np.pi) # Calculate the linewidth from the ratio of voltages
-                linewidths.append(lwidth(vl/vc))
+                if spec[:-10].lower() != 'background':
+                    cal, lw = getlinewidthRMS(trace, 50, 1e5)  # Calculate the calibration factor linewidth
 
-                print('Laser linewidth of {:s} determined to be {:.2f} kHz. \nRMS values of voltage were {:.2f} and {:.2f} mV @ 30 Hz and up to 100 kHz respectively\n'.format(file[-1], linewidths[-1]/1e3, vRMScalib[-1]/1e-3, vRMSlinewidth[-1]/1e-3))
+                    file.append(spec[:-10]) # Laser name
+                    cal_res.append(cal) # Store the calibration value
+                    lw_res.append(lw) # Store the calculated linewidth
 
-        # V_RMS results
-        header = ['File', 'V_RMS (30 Hz)', ' V_RMS (linewidth)', 'linewidth'] # Header for output
-        output = [header] + np.transpose([file, vRMScalib, vRMSlinewidth, linewidths]).tolist() # Output cotent formatted for .csv
+                    ax.plot(trace.x, trace.PSD, linestyle = '-', linewidth = 1, alpha = .75, label = spec[:-10]) # Plot the traces
+                    print('Laser linewidth of {:s} determined to be {:.2f} kHz. The frequency to voltage calibration was {:2f} kHz/V \n'.format(file[-1], lw_res[-1]/1e3, cal_res[-1]/1e3))
+
+            # PSD results
+            header = ['File', 'Calibration [Hz/V]', 'linewidth [Hz]'] # Header for output
+            output = [header] + np.transpose([file, cal_res, lw_res]).tolist() # Output cotent formatted for .csv
+
+        elif method == 'VRMS':
+
+            # Initialise the list of method specific results
+            vRMSlw_res = []
+            FSR = 20e6 # Free spectral range of the fibre
+            ylabeltext = 'Power spectral density [dBm/Hz]'
+            yscale = 'linear'
+            outtitle = '_dBm'
+
+            # Loop over spectra
+            for spec in spectra:
+                trace = MOGTrace(spec) # Import the traces
+
+                ax.plot(trace.x, trace.y, linestyle = '-', linewidth = 1, alpha = .75, label = spec[:-10]) # Plot the traces
+
+                if spec[:-10].lower() != 'background':
+                    vc = getVrms(trace, 25, 35) # Get the value of V_rms for the 30 Hz peak
+                    vl = getVrms(trace, 50, 1e5) # Get the value of V_rms up to 100 kHz
+
+                    file.append(spec[:-10]) # Laser name
+                    cal_res.append(vc) # Get the value of V_rms for the 30 Hz peak
+                    vRMSlw_res.append(vl) # Get the value of V_rms up to 100 kHz
+                    lwidth = lambda r: r * FSR/(2 * np.pi) # Calculate the linewidth from the ratio of voltages
+                    lw_res.append(lwidth(vl/vc))
+
+                    print('Laser linewidth of {:s} determined to be {:.2f} kHz. \nRMS values of voltage were {:.2f} and {:.2f} mV @ 30 Hz and up to 100 kHz respectively\n'.format(file[-1], lw_res[-1]/1e3, cal_res[-1]/1e-3, vRMSlw_res[-1]/1e-3))
+
+            # V_RMS results
+            header = ['File', 'V_RMS (30 Hz)', ' V_RMS (linewidth)', 'linewidth'] # Header for output
+            output = [header] + np.transpose([file, cal_res, vRMSlw_res, lw_res]).tolist() # Output cotent formatted for .csv
+
+        else:
+            print('Method is invalid')
 
         # Export list of summary results
-        with open("Summary.csv", "w", newline="") as f:
+        with open('Summary'+outtitle+'.csv', "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerows(output)
 
@@ -591,14 +725,15 @@ def MZIrunner(folder):
 
         plt.title('Demodulated Mach-Zehnder beatnote', fontsize=32) # Set the figure title
         plt.xlabel('Frequency [Hz]', fontsize=24) # Set the x-axis label
-        plt.ylabel('Power spectral density [dBm/Hz]', fontsize=24) # Set the y-axis label
+        plt.ylabel(ylabeltext, fontsize=24) # Set the y-axis label
         plt.xticks(size = 18) # Set the size of the x-axis markers
         plt.yticks(size = 18) # Set the size of the y-axis markers
         plt.xscale('log') # Make the x axis logrithmically scaled
+        plt.yscale(yscale) # Scale the y axis appropriately
 
-        plt.savefig('PSD.pdf', bbox_inches='tight') # Save a .pdf of the figure
+        plt.savefig('PSD'+outtitle+'.pdf', bbox_inches='tight') # Save a .pdf of the figure
 
-        #plt.show() # Show the figure
+        plt.show() # Show the figure
 
         os.chdir(cwd) # Reset the working directory
 
@@ -606,38 +741,42 @@ def MZIrunner(folder):
         Print('Close any .pdf files you have open')
         os.chdir(cwd) # Set the working directory to the original directory
 
+# Functions for the program input
+####################################################################################################
 
+####################################################################################################
 # Request the type of analysis.
 def gettask():
-    while True:
+    while True: # Only accept valid responses
         task = input("What kind a spectra do should be analysed?\n1. Three-conrnered hat\n2. Mach-Zehnder beatnote\n3. Both\n")
-        options = ['Three-conrnered hat', 'Mach-Zehnder beatnote', 'Both']
+        options = ['Three-conrnered hat', 'Mach-Zehnder beatnote', 'Both'] # Allowed responses
         options = map(str.lower, options)
-        selections = range(1,4)
-        choices = dict(zip(options, selections))
-        try:
+        selections = range(1,4) # Allowed selections
+        choices = dict(zip(options, selections)) # Dictionary of responses and selections
+        try: # Is the a number?
             int(task)
-
-            if int(task) not in selections:
+            if int(task) not in selections: # Is it not valid selection?
                 print("Invalid choice. Enter a valid selection\n")
-            else:
+            else: # If valid
                 break
 
-        except ValueError:
-            try:
+        except ValueError: #Not a number
+            try: # Was a response enetered?
                 if task.lower() in map(str.lower, options):
                     task = choices[task]
                     break
 
-            except AttributeError:
+            except AttributeError: # Not a valid response
                 pass
 
             print ("Invalid input. Enter a valid selection\n")
 
-    return task
+    return int(task)
 
+####################################################################################################
 # Execture popup for selecting directory for analysis
 def selectdir(analysistype):
+    # Set text for popup window
     if analysistype == 'TCH':
         text = "Three-cornered hat"
     elif analysistype == 'MZB':
@@ -647,79 +786,66 @@ def selectdir(analysistype):
         text = None
 
     if text != None:
-        filedirectory = askdirectory(initialdir = os.getcwd(), title = 'Select directory for ' + text + ' analysis')
+        filedirectory = askdirectory(initialdir = os.getcwd(), title = 'Select directory for ' + text + ' analysis') #execute GUI selection
     else:
         filedirectory = None
 
     return filedirectory
 
+####################################################################################################
+# Run the Three-conered hat analysis with directory selection
+def runTCH_selector():
+    TCHdir = selectdir('TCH') # Choose the location of files
+    TCH_runner(TCHdir, points = 1000, fitsz = 1) # Run the analysis
+
+    # For changing fit parameters, loop until happy
+    while True:
+        alter = input("Do you want to change fit parameters? Y/N\n").upper()
+        if alter == 'N': # Happy, quit
+            break
+        elif alter == 'Y': # Unhappy, choose new parameters
+            while True:
+                newpoints = int(input("Enter the number of points for the interpolation (usually between 500 - 1000):\n"))
+                try:
+                    int(newpoints)
+                    break
+                except ValueError:
+                    print("Enter a valid value")
+
+            while True:
+                newfit = float(input("Enter the scale factor for the fit (0-1]:\n"))
+                if (newfit <= 1) and (newfit > 0):
+                    break
+                else:
+                    print("Enter a valid value")
+
+            TCH_runner(TCHdir, newpoints, newfit) # Rerun analysis with new parameters
+        else:
+            print("Enter a valid response, Y or N")
+
+####################################################################################################
+# Run the Mach-Zehnder beatnote anaysis with directory selection
+def runMZB_selector():
+    MZBdir = selectdir('MZB')
+    MZIrunner(MZBdir)
+
+####################################################################################################
+# Get task(s) and execute analysis
 def getandrun():
+    todo = gettask() # Get task(s)
+    if todo == 1: # Three-conered hat analysis
+        runTCH_selector()
 
-    todo = int(gettask())
+    elif todo == 2: # Mach-Zehnder beatone analysis
+        runMZB_selector()
 
-    if todo == 1:
-        TCHdir = selectdir('TCH')
-        TCH_runner(TCHdir, points = 1000, fitsz = 1)
+    elif todo == 3: # Both Three-conered hat and Mach-Zehnder beatone analysis
+        runTCH_selector()
+        runMZB_selector()
 
-        while True:
-            alter = input("Do you want to change fit parameters? Y/N\n").upper()
-            if alter == 'N':
-                break
-            elif alter == 'Y':
-                while True:
-                    newpoints = int(input("Enter the number of points for the interpolation (usually between 500 - 1000):\n"))
-                    try:
-                        int(newpoints)
-                        break
-                    except ValueError:
-                        print("Enter a valid value")
-
-                while True:
-                    newfit = float(input("Enter the scale factor for the fit (0-1]:\n"))
-                    if (newfit <= 1) and (newfit > 0):
-                        break
-                    else:
-                        print("Enter a valid value")
-
-                TCH_runner(TCHdir, newpoints, newfit)
-            else:
-                print("Enter a valid response, Y or N")
-
-    elif todo == 2:
-        MZBdir = selectdir('MZB')
-        MZIrunner(MZBdir)
-
-    elif todo == 3:
-        TCHdir = selectdir('TCH')
-        MZBdir = selectdir('MZB')
-        
-        TCH_runner(TCHdir, points = 1000, fitsz = 1)
-        while True:
-            alter = input("Do you want to change fit parameters? Y/N\n").upper()
-            if alter == 'N':
-                break
-            elif alter == 'Y':
-                while True:
-                    newpoints = int(input("Enter the number of points for the interpolation (usually between 500 - 1000):\n"))
-                    try:
-                        int(newpoints)
-                        break
-                    except ValueError:
-                        print("Enter a valid value")
-
-                while True:
-                    newfit = float(input("Enter the scale factor for the fit (0-1]:\n"))
-                    if (newfit <= 1) and (newfit > 0):
-                        break
-                    else:
-                        print("Enter a valid value")
-
-                TCH_runner(TCHdir, newpoints, newfit)
-            else:
-                print("Enter a valid response, Y or N")
-
-
-        MZIrunner(MZBdir)
+####################################################################################################
+# Program starts here
+####################################################################################################
 
 if __name__ == "__main__":
     getandrun()
